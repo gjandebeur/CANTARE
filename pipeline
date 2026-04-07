@@ -1,0 +1,438 @@
+# ── CONFIG (edit this section) ────────────────────────────────────────────────
+ 
+# Path to your subject-level data.
+# Accepts .csv, .tsv, or .xlsx. One row per subject, columns = analytes +
+# covariates. Column names must match node names in the VOLARE JSON.
+data_path <- ""
+ 
+# For Excel files only: which sheet contains the data? (ignored for CSV/TSV)
+data_sheet <- 1
+ 
+# Path to VOLARE JSON (network definition)
+volare_json_path <- ""
+ 
+# Output directory for figures (created automatically if it doesn't exist)
+out_dir <- ""
+ 
+# Hub nodes to analyze — must match node names in the VOLARE JSON exactly.
+# These are your outcome variables.
+hubs <- c(
+  ""
+)
+ 
+# Optional: column name for a grouping variable (e.g., treatment arm).
+# Used only for line coloring in figures. Set to NULL if not applicable.
+group_col <- NULL
+ 
+# Optional: covariates to force into every model (e.g., age, sex).
+# Set to NULL or c() if none.
+forced_covariates <- c()
+ 
+# Ego-graph order: 1 = immediate neighbors, 2 = neighbors-of-neighbors
+ego_order <- 2
+ 
+# Outcome type: "continuous" (OLS, R-squared) or "binary" (logistic, AUC/OR)
+outcome_mode <- "continuous"
+ 
+# Minimum complete cases required to run a hub
+min_complete_n <- 10
+ 
+# Stepwise selection direction: "backward", "forward", or "both"
+step_direction <- "backward"
+ 
+# Figure resolution (DPI)
+figure_dpi <- 300
+ 
+# Hex alpha suffix for network node colors (00=transparent, FF=opaque)
+alpha_hex <- "45"
+ 
+ 
+# ── LIBRARIES ─────────────────────────────────────────────────────────────────
+ 
+required_pkgs <- c("igraph", "jsonlite", "rms", "grid", "gridExtra",
+                    "gridBase", "readxl", "dplyr")
+ 
+missing <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Missing packages: ", paste(missing, collapse = ", "),
+       "\nInstall with: install.packages(c('",
+       paste(missing, collapse = "', '"), "'))", call. = FALSE)
+}
+ 
+suppressPackageStartupMessages({
+  library(igraph)
+  library(jsonlite)
+  library(rms)
+  library(grid)
+  library(gridExtra)
+  library(gridBase)
+  library(readxl)
+  library(dplyr)
+})
+ 
+ 
+# ── DATA LOADING ──────────────────────────────────────────────────────────────
+ 
+load_subject_data <- function(path, sheet = 1) {
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("csv", "tsv")) {
+    sep <- ifelse(ext == "tsv", "\t", ",")
+    dat <- read.csv(path, sep = sep, stringsAsFactors = FALSE)
+  } else if (ext %in% c("xlsx", "xls")) {
+    dat <- readxl::read_excel(path, sheet = sheet)
+    dat <- as.data.frame(dat)
+  } else {
+    stop("Unsupported file type: .", ext,
+         "\nSupported: .csv, .tsv, .xlsx, .xls", call. = FALSE)
+  }
+  cat("Loaded data:", nrow(dat), "rows x", ncol(dat), "cols\n")
+  return(dat)
+}
+ 
+ 
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+ 
+table_theme <- gridExtra::ttheme_default(
+  core    = list(fg_params = list(cex = 0.6)),
+  colhead = list(fg_params = list(cex = 0.6)),
+  rowhead = list(fg_params = list(cex = 0.6))
+)
+ 
+clean_label <- function(x) {
+  x <- gsub("..", " ",  x, fixed = TRUE)
+  x <- gsub("H ",  "H+", x, fixed = TRUE)
+  x <- gsub("\\.$", "*", x)
+  return(x)
+}
+ 
+ 
+# ── NETWORK CONSTRUCTION ─────────────────────────────────────────────────────
+ 
+build_network <- function(j, alpha_hex = "45") {
+  summary_df  <- as.data.frame(j$summary)
+  graph_data  <- summary_df[, c("Analyte1", "Analyte2")]
+  net         <- igraph::graph.data.frame(graph_data, directed = FALSE)
+ 
+  assay_colors <- unlist(j$configuration$assays)
+  assays       <- names(assay_colors)
+  colors       <- paste0(unname(assay_colors), alpha_hex)
+ 
+  V(net)$color <- colors[1]
+  for (i in seq_along(assays)[-1]) {
+    pattern <- paste0("^", assays[i])
+    V(net)$color[grep(pattern, V(net)$name)] <- colors[i]
+  }
+  return(net)
+}
+ 
+compute_ego_stats <- function(net, ego_order = 2) {
+  gg <- igraph::make_ego_graph(net, order = ego_order, nodes = V(net))
+  stats <- data.frame(
+    vertex    = V(net)$name,
+    ego_size  = igraph::ego_size(net, order = ego_order),
+    n_deg_gt2 = vapply(gg, function(x) sum(igraph::degree(x) >= 2), integer(1)),
+    density   = vapply(gg, igraph::graph.density, numeric(1)),
+    stringsAsFactors = FALSE
+  )
+  return(list(ego_graphs = gg, stats = stats))
+}
+ 
+ 
+# ── RUNNING-FIT VISUALIZATION ────────────────────────────────────────────────
+ 
+running_fit <- function(f, stats, dc, group_labels = NULL,
+                        hub_name, out_dir, outcome_mode = "continuous",
+                        j_config = NULL, dpi = 300) {
+ 
+  model_coefs <- f$coef
+  model_mat   <- model.matrix(f)
+ 
+  if (colnames(model_mat)[1] == "Intercept") {
+    d_thin <- as.data.frame(model_mat[, -1, drop = FALSE])
+  } else {
+    d_thin <- as.data.frame(model_mat)
+  }
+ 
+  betas <- model_coefs[2:length(model_coefs)]
+ 
+  if (length(betas) > 1) {
+    x_contrib <- as.matrix(d_thin) %*% diag(betas)
+  } else {
+    x_contrib <- as.matrix(d_thin) * betas
+  }
+  colnames(x_contrib) <- names(betas)
+ 
+  pred_names <- names(betas)
+  df_pred    <- as.data.frame(model_mat[, pred_names, drop = FALSE])
+ 
+  # IQR-based effect sizes
+  qtiles    <- t(sapply(df_pred, quantile, c(0, 0.25, 0.75, 1)))
+  use_range <- qtiles[, 2] == qtiles[, 3]
+  iqr_adj   <- qtiles[, c(2, 3)]
+  iqr_adj[use_range, ] <- qtiles[use_range, c(1, 4)]
+  iqr <- t(iqr_adj)
+ 
+  beta_nf <- betas[pred_names]
+  if (length(beta_nf) > 1) {
+    effect_iqr <- iqr %*% diag(beta_nf)
+  } else {
+    effect_iqr <- iqr * beta_nf
+  }
+  colnames(effect_iqr) <- names(beta_nf)
+  delta      <- effect_iqr[2, ] - effect_iqr[1, ]
+  effect_iqr <- rbind(iqr, delta)
+ 
+  et         <- as.data.frame(t(effect_iqr))
+  beta_order <- order(delta)
+  et_sorted  <- et[beta_order, ]
+ 
+  if (outcome_mode == "binary") {
+    et_sorted$OR <- exp(et_sorted$delta)
+  } else {
+    et_sorted$IQR_Effect <- round(et_sorted$delta, 3)
+  }
+ 
+  et_sorted$unit <- use_range[rownames(et_sorted)]
+  et_sorted$unit <- gsub("FALSE", "IQR",   et_sorted$unit)
+  et_sorted$unit <- gsub("TRUE",  "range", et_sorted$unit)
+ 
+  beta_o   <- betas[rownames(et_sorted)]
+  x_sorted <- x_contrib[, names(beta_o), drop = FALSE]
+ 
+  # Cumulative running-fit frame
+  mm       <- as.data.frame(cbind(model_coefs[1], x_sorted))
+  cum_pred <- mm[, 1, drop = FALSE]
+  for (i in 2:ncol(mm)) {
+    cum_pred <- cbind(cum_pred, rowSums(mm[, 1:i]))
+  }
+  cum_pred <- cum_pred[, -1, drop = FALSE]
+  colnames(cum_pred) <- names(beta_o)
+ 
+  if (outcome_mode == "binary") {
+    e_star   <- exp(cum_pred)
+    cum_pred <- e_star / (1 + e_star)
+  }
+ 
+  y        <- dc$y
+  cum_pred <- as.data.frame(cbind(cum_pred, observed = as.numeric(y)))
+  n_cols   <- ncol(cum_pred)
+ 
+  label_names <- c(names(beta_o), "observed")
+  label_clean <- clean_label(c(names(beta_o), "actual"))
+ 
+  to_fold <- colnames(cum_pred)
+  mm_long <- reshape(cum_pred, direction = "long", varying = to_fold,
+                     times = to_fold, timevar = "metric", v.names = "value")
+  mm_long$metric <- factor(mm_long$metric, ordered = TRUE, levels = label_names)
+ 
+  col_means <- apply(cum_pred, 2, mean)
+ 
+  # Line colors by group
+  highlight_cols <- if (!is.null(j_config$colors)) {
+    j_config$colors
+  } else {
+    c("#1b9e77", "#d95f02")
+  }
+ 
+  if (!is.null(group_labels) && length(unique(group_labels)) >= 2) {
+    grp_levels  <- sort(unique(group_labels))
+    line_colors <- ifelse(
+      group_labels == grp_levels[1],
+      adjustcolor(highlight_cols[1], alpha.f = 0.4),
+      adjustcolor(highlight_cols[2], alpha.f = 0.4)
+    )
+  } else {
+    line_colors <- rep(adjustcolor("grey40", alpha.f = 0.4), nrow(cum_pred))
+  }
+ 
+  # Assay-based label colors
+  assay_colors <- if (!is.null(j_config$assays)) unlist(j_config$assays) else NULL
+  if (!is.null(assay_colors)) {
+    beta_assay <- paste0(
+      vapply(label_clean, function(x) strsplit(x, "_", fixed = TRUE)[[1]][1],
+             character(1)), "_"
+    )
+    label_color <- unlist(assay_colors[beta_assay])
+    label_color[is.na(label_color)] <- "black"
+  } else {
+    label_color <- rep("black", length(label_clean))
+  }
+ 
+  fig_width <- max(0.75 * (length(beta_o) + 1.75), 5)
+ 
+  if (outcome_mode == "binary") {
+    main_title <- sprintf("%s hub, cumulative fit\nAUC = %.2f", hub_name, stats[["C"]])
+    y_label    <- "predicted probability"
+  } else {
+    main_title <- sprintf("%s hub, cumulative fit\nR2 = %.2f", hub_name, stats[["R2"]])
+    y_label    <- paste0("predicted ", hub_name)
+  }
+  sub_title <- "predictors (ordered by effect size, smallest to largest)"
+ 
+  # ── Running-fit plot ──
+  fit_path <- file.path(out_dir, paste0(hub_name, "_running_fit.png"))
+  png(fit_path, width = fig_width, height = 4.25, units = "in", res = dpi)
+  par(omi = c(0, 0.6, 0, 0))
+  interaction.plot(
+    mm_long$metric, mm_long$id, mm_long$value,
+    legend = FALSE, ylab = y_label, cex.lab = 0.8, xlab = NA, lty = 1,
+    col = line_colors, xaxt = "n", main = main_title, sub = sub_title,
+    font.main = 1, cex.main = 0.8, cex.sub = 0.6
+  )
+  y_base <- par("usr")[3]
+  text(x = seq_len(n_cols), y = y_base, labels = label_clean,
+       font = 2, srt = 30, xpd = NA, cex = 0.5, adj = c(0.99, 0.9),
+       col = label_color)
+  abline(v = n_cols - 1, col = "black", lty = 1, lwd = 2)
+  abline(v = seq_len(n_cols - 2), col = "black", lty = 3, lwd = 0.5)
+  lines(seq_len(nlevels(mm_long$metric)), col_means, col = "black", lty = 2)
+  dev.off()
+ 
+  # ── Effect-size table ──
+  if (outcome_mode == "binary") {
+    tbl_data <- et_sorted[, c(1, 2, 4, 5)]
+    colnames(tbl_data) <- c("Low", "High", "Odds Ratio", "Unit")
+    tbl_data[, 3] <- round(tbl_data[, 3], 2)
+  } else {
+    tbl_data <- et_sorted[, c(1, 2, 4, 5)]
+    colnames(tbl_data) <- c("Low", "High", "IQR Effect", "Unit")
+  }
+  tbl_data[, 1:2] <- round(tbl_data[, 1:2], 3)
+  rownames(tbl_data) <- clean_label(rownames(tbl_data))
+ 
+  tbl        <- gridExtra::tableGrob(tbl_data, theme = table_theme)
+  tbl_height <- 2.5 + nrow(tbl_data) %/% 4
+ 
+  eff_path <- file.path(out_dir, paste0(hub_name, "_effects.png"))
+  png(eff_path, width = 5, height = tbl_height, units = "in", res = dpi)
+  gridExtra::grid.arrange(left = "Effect size", tbl, widths = 4)
+  dev.off()
+ 
+  cat("  Wrote:", fit_path, "\n")
+  cat("  Wrote:", eff_path, "\n")
+ 
+  invisible(list(model_mat = model_mat, betas = betas,
+                 x_contrib = x_contrib, x_sorted = x_sorted,
+                 cum_pred = cum_pred))
+}
+ 
+ 
+# ── HUB ANALYSIS ─────────────────────────────────────────────────────────────
+ 
+analyze_hub <- function(hub, person_dat, ego_graphs, ego_stats,
+                        group_col = NULL, forced_covariates = c(),
+                        out_dir, outcome_mode = "continuous",
+                        step_direction = "backward",
+                        min_complete_n = 10, j_config = NULL,
+                        dpi = 300) {
+ 
+  cat("\n", strrep("\u2550", 50), "\n", sep = "")
+  cat("Hub:", hub, "\n")
+ 
+  hub_row <- which(ego_stats$vertex == hub)
+  if (length(hub_row) == 0) {
+    cat("  Skipping — hub not found in network.\n")
+    return(invisible(NULL))
+  }
+ 
+  sub_net    <- ego_graphs[[hub_row]]
+  neighbors  <- V(sub_net)$name
+  avail_cols <- intersect(neighbors, colnames(person_dat))
+  avail_cols <- setdiff(avail_cols, c(hub, group_col, "y"))
+ 
+  keep_cols <- unique(c(group_col, forced_covariates, hub, avail_cols))
+  keep_cols <- intersect(keep_cols, colnames(person_dat))
+ 
+  dc   <- person_dat[, keep_cols, drop = FALSE]
+  dc   <- dc[complete.cases(dc), ]
+ 
+  group_labels <- if (!is.null(group_col) && group_col %in% colnames(dc)) {
+    dc[[group_col]]
+  } else {
+    NULL
+  }
+ 
+  dc$y <- dc[[hub]]
+  dc[[hub]] <- NULL
+  if (!is.null(group_col) && group_col %in% colnames(dc)) {
+    dc[[group_col]] <- NULL
+  }
+ 
+  if (nrow(dc) < min_complete_n) {
+    cat("  Skipping — N =", nrow(dc), "(< min_complete_n)\n")
+    return(invisible(NULL))
+  }
+ 
+  fm     <- lm(y ~ ., data = dc)
+  rm_fit <- step(fm, direction = step_direction, trace = 0)
+  cc     <- coef(summary(rm_fit))
+ 
+  if (nrow(cc) < 2) {
+    cat("  Skipping — no predictors survived selection.\n")
+    return(invisible(NULL))
+  }
+ 
+  red_cols <- rownames(cc)[2:nrow(cc)]
+  dd_frame <- dc[, c("y", red_cols), drop = FALSE]
+ 
+  dd <- rms::datadist(dd_frame)
+  options(datadist = "dd")
+ 
+  f         <- rms::ols(y ~ ., data = dd_frame, x = TRUE, y = TRUE)
+  R2        <- f$stats["R2"]
+  model_aic <- AIC(rm_fit)
+  fit_stats <- list(R2 = R2, AIC = model_aic)
+ 
+  cat(sprintf("  N: %d | Predictors: %d | R2: %.3f | AIC: %.1f\n",
+              nrow(dc), length(red_cols), R2, model_aic))
+ 
+  graphics.off()
+  result <- running_fit(
+    f, fit_stats, dc = dc, group_labels = group_labels,
+    hub_name = hub, out_dir = out_dir,
+    outcome_mode = outcome_mode, j_config = j_config, dpi = dpi
+  )
+  return(invisible(result))
+}
+ 
+ 
+
+cat("CANTARE Pipeline\n")
+cat(strrep("\u2550", 50), "\n")
+ 
+# Validate paths
+stopifnot("data_path is empty — set it in the CONFIG block" = nchar(data_path) > 0)
+stopifnot("volare_json_path is empty — set it in the CONFIG block" = nchar(volare_json_path) > 0)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+ 
+# Load VOLARE network
+j   <- jsonlite::fromJSON(volare_json_path)
+net <- build_network(j, alpha_hex = alpha_hex)
+ego <- compute_ego_stats(net, ego_order = ego_order)
+cat("Network:", vcount(net), "nodes,", ecount(net), "edges\n")
+ 
+# Load subject-level data
+person_dat <- load_subject_data(data_path, sheet = data_sheet)
+cat("\n")
+ 
+# Analyze each hub
+results <- list()
+for (hub in hubs) {
+  results[[hub]] <- analyze_hub(
+    hub          = hub,
+    person_dat   = person_dat,
+    ego_graphs   = ego$ego_graphs,
+    ego_stats    = ego$stats,
+    group_col    = group_col,
+    forced_covariates = forced_covariates,
+    out_dir      = out_dir,
+    outcome_mode = outcome_mode,
+    step_direction = step_direction,
+    min_complete_n = min_complete_n,
+    j_config     = j$configuration,
+    dpi          = figure_dpi
+  )
+}
+ 
+cat("\n", strrep("\u2550", 50), "\n", sep = "")
+cat("Done. Figures written to:", out_dir, "\n")
